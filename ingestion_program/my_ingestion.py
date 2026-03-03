@@ -38,7 +38,7 @@ def evaluate_model(model, data_dir):
 
 
 def main(data_dir, output_dir):
-    from submission import train_model
+    from my_submission import train_model
     from tokam2d_utils.xml_loader import dump_to_xml
 
     training_dir = data_dir / "train"
