@@ -1,7 +1,7 @@
 import torch
 import copy
-from torch.utils.data import Subset, DataLoader
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torch.utils.data import ConcatDataset, DataLoader
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
 from torchvision.transforms import v2
 
 from tokam2d_utils import TokamDataset
@@ -46,55 +46,37 @@ def train_model(training_dir):
     """
     Increasing the dataset by modifying the existing dataset with rotation, zoom of the pictures
     """
-    transforms = v2.Compose([v2.RandomHorizontalFlip(p=0.5),
-                             v2.RandomVerticalFlip(p=0.5),
+    transforms = v2.Compose([v2.RandomVerticalFlip(p=0.5),
                              v2.RandomAffine(degrees=(-45, 45), scale=(0.8, 1.2)),
                              v2.SanitizeBoundingBoxes()])
 
-    complete_train_dataset = TokamDataset(training_dir, include_unlabeled=False, transforms= transforms)
-
-
-    """
-    Creating a validating set from the training data to evince too much 
-    validation on CodaBench which one is confronted to a lot of Server Error. 
-    """
-    complete_val_dataset = TokamDataset(training_dir, include_unlabeled=False)
-
-
-    total_size = len(complete_train_dataset)
-    train_size = int(total_size * 0.8)
-
-    random_index = torch.randperm(total_size).tolist()
-    train_index = random_index[:train_size]
-    val_index = random_index[train_size:]
-
-    train_subset = Subset(complete_train_dataset, train_index)
-    val_subset = Subset(complete_val_dataset, val_index)
+    transform_train_dataset = TokamDataset(training_dir, include_unlabeled=False, transforms= transforms)
 
     train_dataloader = DataLoader(
-        train_subset, batch_size=4, collate_fn=collate_fn, shuffle=True
+        transform_train_dataset, batch_size=4, collate_fn=collate_fn, shuffle=True
     )
 
-    val_dataloader = DataLoader(
-        val_subset, batch_size=4, collate_fn=collate_fn, shuffle=False
-    )
+    # train_dataset = TokamDataset(training_dir, include_unlabeled=False)
+
+    # train_dataloader = DataLoader(
+    #     train_dataset, batch_size=4, collate_fn=collate_fn, shuffle=True
+    # )
 
     if torch.cuda.is_available():
         print("Using GPU")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = fasterrcnn_resnet50_fpn()
+    # model = fasterrcnn_resnet50_fpn()
+    model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+
     model.to(device)
     model.train()
 
+    max_epochs = 5
+    
     optimizer = torch.optim.AdamW(model.parameters(), lr= 5e-5, weight_decay=5e-5)
 
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
-
-    max_epochs = 20
-
-    best_loss = float('inf')
-    best_model_weights = None
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-6)
 
     for i in range(max_epochs):
         print(f"Epoch {i+1}/{max_epochs}")
@@ -108,27 +90,8 @@ def train_model(training_dir):
             full_loss = sum(loss for loss in loss_dict.values())
             full_loss.backward()
             optimizer.step()
-        
 
-        val_loss_total = 0.0
-        with torch.no_grad():
-            for val_images, val_targets in val_dataloader:
-                val_images = [im.to(device) for im in val_images]
-                val_targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in val_targets]
-                val_loss_dict = model(val_images, val_targets)
-                val_loss = sum(loss for loss in val_loss_dict.values())
-                val_loss_total += val_loss.item()
-    
-        val_loss_mean = val_loss_total / len(val_dataloader)
-        print(f"Validation Loss: {val_loss_mean}")
-
-        scheduler.step(val_loss_mean)
-
-        if val_loss_mean < best_loss:
-            best_loss = val_loss_mean
-            best_model_weights = copy.deepcopy(model.state_dict())
-
-    model.load_state_dict(best_model_weights)
+        scheduler.step()
 
 
     """
@@ -146,36 +109,47 @@ def train_model(training_dir):
     teacher_model = ModelFilter(model, threshold=0.85)
     pseudo_labeled_data = []
 
-    # 2. Notre sécurité anti-crash et anti-timeout
     images_traitees = 0
     limite_images = 50 
 
+    # Utilisation d'un itérateur manuel pour capturer l'IndexError silencieusement
+    data_iterator = iter(unlabeled_dataloader)
+
     with torch.no_grad():
-        for unlabeled_images, _ in unlabeled_dataloader:
-            
-            # Si on a atteint la limite, on explose la boucle !
+        while True:
             if images_traitees >= limite_images:
                 break
                 
-            gpu_images= [im.to(device) for im in unlabeled_images]
+            try:
+                # On tente de charger le prochain batch
+                unlabeled_images, _ = next(data_iterator)
+            except StopIteration:
+                # Fin normale du DataLoader
+                break
+            except IndexError:
+                # Bug du dataset CodaBench atteint, on arrête proprement
+                print("IndexError interceptée : données corrompues ignorées.")
+                break
 
+            gpu_images= [im.to(device) for im in unlabeled_images]
             filtered_predictions = teacher_model(gpu_images)
 
             for i, pred in enumerate(filtered_predictions):
                 if len(pred['boxes']) > 0:
-                    
                     pseudo_target = {
                         'boxes': pred['boxes'].cpu(),
                         'labels': pred['labels'].to(torch.int64).cpu()
                     }
-    
                     pseudo_labeled_data.append((unlabeled_images[i], pseudo_target))
             
-            # On ajoute le nombre d'images de ce batch (ex: 2) à notre compteur
             images_traitees += len(unlabeled_images)
 
+    if len(pseudo_labeled_data) == 0:
+        raise RuntimeError("Erreur : Aucun pseudo-label n'a été généré. Le modèle initial n'est pas assez confiant ou le threshold (0.85) est trop élevé.")
     
-    mixed_train_dataset= list(train_subset) + pseudo_labeled_data
+    mixed_train_dataset = ConcatDataset([transform_train_dataset, pseudo_labeled_data])
+
+    # mixed_train_dataset= list(train_dataset) + pseudo_labeled_data
 
     mixed_train_dataloader= DataLoader(
         mixed_train_dataset, batch_size=4, collate_fn=collate_fn, shuffle=True
@@ -186,10 +160,11 @@ def train_model(training_dir):
     """
     model.train()
 
-    max_epochs = 10
+    max_epochs = 5
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr= 5e-5, weight_decay=5e-5)
 
-    best_loss = float('inf')
-    best_model_weights = None
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs, eta_min=1e-6)
 
     for i in range(max_epochs):
         print(f"Epoch {i+1}/{max_epochs}")
@@ -203,28 +178,8 @@ def train_model(training_dir):
             full_loss = sum(loss for loss in loss_dict.values())
             full_loss.backward()
             optimizer.step()
-        
 
-        val_loss_total = 0.0
-        with torch.no_grad():
-            for val_images, val_targets in val_dataloader:
-                val_images = [im.to(device) for im in val_images]
-                val_targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in val_targets]
-                val_loss_dict = model(val_images, val_targets)
-                val_loss = sum(loss for loss in val_loss_dict.values())
-                val_loss_total += val_loss.item()
-    
-        val_loss_mean = val_loss_total / len(val_dataloader)
-        print(f"Validation Loss: {val_loss_mean}")
-
-        scheduler.step(val_loss_mean)
-
-        if val_loss_mean < best_loss:
-            best_loss = val_loss_mean
-            best_model_weights = copy.deepcopy(model.state_dict())
-
-
-    model.load_state_dict(best_model_weights)
+        scheduler.step()
 
     model.eval().to("cpu")
 
